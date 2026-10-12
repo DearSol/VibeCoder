@@ -8,7 +8,13 @@ export const MAX_LAYERS = 32;
 export type Layer = {
   id: string;
   name: string;
-  kind: 'original' | 'patch';
+  kind: 'original' | 'patch' | 'generated';
+  generation?: {
+    provider: string;
+    model: string;
+    prompt: string;
+    references: { name: string; image: string }[];
+  };
   canvas: HTMLCanvasElement;
   x: number;
   y: number;

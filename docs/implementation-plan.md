@@ -1,6 +1,6 @@
 # Expand Studio — implementation plan
 
-This plan implements [the product specification](product-spec.md). The local editor foundation is implemented, including a browser workspace, masked Patch with Poisson or feather blending, history, project persistence, and PNG export. The Tauri Windows shell is scaffolded; native compilation and Windows behavior remain unverified. AI generation has not been implemented. See the README for current commands and limits.
+This plan implements [the product specification](product-spec.md). The local editor foundation and npm AI testing paths are implemented, including visible modes, grouped selections, optional Poisson blending, references, exact expansion geometry, history, projects, and PNG export. OpenAI, Gemini, OpenRouter, and experimental Kie Nano Banana Pro adapters have simulated-response checks; no live provider calls have been validated. The Tauri Windows shell is scaffolded; native AI access, credential storage, compilation, and Windows behavior remain unverified. See the README and [guide audit](guide-audit.md) for current commands, scope, and gaps.
 
 ## Development approach
 
@@ -89,4 +89,4 @@ Then evaluate four alternatives with bounded concurrency, magnetic selection, ad
 
 ## Next implementation task
 
-Finish native Windows validation of milestone 1, then build milestone 2's live Generative Fill integration using the shared selection, layer, compositing, and project systems. The existing Poisson solver also accepts a separate source image for later generated-content blending.
+Validate the npm adapters with live provider keys on the user's PC, including difficult selections, reference fidelity, and expansion alignment. Then complete native Windows AI/credential integration, job recovery, retained alternatives, and the remaining guide requirements. Milestones are not complete merely because their initial UI and adapter paths exist.

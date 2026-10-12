@@ -26,6 +26,10 @@ import {
   SquareDashed,
   Undo2,
   X,
+  CircleDashed,
+  Lasso,
+  Waypoints,
+  Magnet,
 } from 'lucide-react';
 import { EditorCanvas, type CanvasHandle, type Tool } from './components/EditorCanvas';
 import {
@@ -52,6 +56,15 @@ import {
 import { blendInWorker } from './model/blend-worker';
 import { createDemo, loadProject, saveProject } from './io/project';
 import { isTauri, openNativeFile, saveFile } from './io/files';
+import { AiPanel, type AiSettings } from './components/AiPanel';
+import { generateImage } from './ai/client';
+import { loadResult, prepareEdit } from './ai/images';
+import type { EditRequest, JobView } from './ai/providers';
+import { MAX_POISSON_AREA } from './model/poisson';
+import { ToolGroup } from './components/ToolGroup';
+import { ExpandControls } from './components/ExpandControls';
+import { expansionDocument, emptyMargins } from './model/expand';
+import { editingModes, type EditingMode } from './model/modes';
 
 function IconButton({
   label,
@@ -95,6 +108,10 @@ function Thumbnail({ surface }: { surface: HTMLCanvasElement }) {
 
 const tools: { id: Tool; label: string; key: string; icon: ReactNode }[] = [
   { id: 'marquee', label: 'Marquee selection', key: 'M', icon: <SquareDashed /> },
+  { id: 'ellipse', label: 'Elliptical marquee', key: 'M', icon: <CircleDashed /> },
+  { id: 'lasso', label: 'Freehand lasso', key: 'L', icon: <Lasso /> },
+  { id: 'polygon', label: 'Polygonal lasso', key: 'L', icon: <Waypoints /> },
+  { id: 'magnetic', label: 'Magnetic lasso', key: 'L', icon: <Magnet /> },
   { id: 'brush', label: 'Selection brush', key: 'B', icon: <Paintbrush /> },
   { id: 'patch', label: 'Local patch', key: 'P', icon: <Scan /> },
   { id: 'hand', label: 'Hand tool', key: 'H', icon: <Hand /> },
@@ -104,6 +121,16 @@ export default function App() {
   const [history, setHistory] = useState(emptyHistory),
     doc = history.present;
   const [tool, setTool] = useState<Tool>('marquee');
+  const [mode, setMode] = useState<EditingMode>('fill');
+  const [margins, setMargins] = useState(emptyMargins);
+  const [textScale, setTextScale] = useState(() => {
+    try {
+      const value = Number(localStorage.getItem('expand-text-scale'));
+      return [1, 1.15, 1.3].includes(value) ? value : 1;
+    } catch {
+      return 1;
+    }
+  });
   const [selectionMode, setSelectionMode] = useState<SelectionMode>('replace');
   const [brushSize, setBrushSize] = useState(64),
     [feather, setFeather] = useState(0);
@@ -122,6 +149,19 @@ export default function App() {
   const [pendingFile, setPendingFile] = useState<File | null>(null),
     [help, setHelp] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [aiJob, setAiJob] = useState<JobView | null>(null);
+  const [aiProposal, setAiProposal] = useState<{
+    document: EditorDocument;
+    layer: Layer;
+    preview: string;
+  } | null>(null);
+  const aiAttempt = useRef<{
+    document: EditorDocument;
+    prepared: ReturnType<typeof prepareEdit>;
+    settings: AiSettings;
+    input: EditRequest;
+    feather: number;
+  } | null>(null);
   const input = useRef<HTMLInputElement>(null),
     canvasRef = useRef<CanvasHandle>(null),
     abortRef = useRef<AbortController | null>(null);
@@ -159,6 +199,25 @@ export default function App() {
     }
   }, [doc?.width, doc?.height, sourcePixels, effectiveMask, patchOffset, tool]);
   const activeLayer = doc?.layers.find((layer) => layer.id === selectedLayer) || doc?.layers.at(-1);
+  const expansion = useMemo(() => {
+    if (!doc || mode !== 'expand') return null;
+    try {
+      return expansionDocument(doc, margins);
+    } catch {
+      return null;
+    }
+  }, [doc, mode, margins]);
+  const displayDoc = mode === 'expand' ? expansion || doc : doc;
+  const displayComposite = useMemo(
+    () => (expansion ? composite(expansion) : visible),
+    [expansion, visible],
+  );
+  const hasExpansion = !!expansion && Object.values(margins).some((value) => value > 0);
+  useEffect(() => {
+    try {
+      localStorage.setItem('expand-text-scale', String(textScale));
+    } catch {}
+  }, [textScale]);
 
   useEffect(() => {
     setPatchOffset({ x: 0, y: 0 });
@@ -180,9 +239,26 @@ export default function App() {
     setCompare(false);
   };
   const chooseTool = (next: Tool) => {
+    if (next === 'patch') setMode('repair');
+    else if (mode === 'expand' && next !== 'hand') setMode('fill');
     setTool(next);
     setCompare(false);
     setPatchOffset({ x: 0, y: 0 });
+  };
+  const chooseMode = (next: EditingMode) => {
+    setMode(next);
+    setCompare(false);
+    setPatchOffset({ x: 0, y: 0 });
+    setTool(
+      next === 'repair'
+        ? 'patch'
+        : next === 'expand'
+          ? 'hand'
+          : tool === 'patch' || tool === 'hand'
+            ? 'marquee'
+            : tool,
+    );
+    setStatus(editingModes.find((item) => item.id === next)!.description);
   };
   const run = async (label: string, operation: () => Promise<void>) => {
     setBusy(label);
@@ -191,7 +267,11 @@ export default function App() {
       await operation();
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError')
-        setStatus('Blending cancelled. Your image is unchanged.');
+        setStatus(
+          label.startsWith('AI')
+            ? 'Local waiting stopped. The provider may still finish and charge. Your image is unchanged.'
+            : 'Blending cancelled. Your image is unchanged.',
+        );
       else
         setError(
           caught instanceof Error ? caught.message : 'The operation could not be completed.',
@@ -210,6 +290,8 @@ export default function App() {
       setSelectedLayer(next.layers.at(-1)!.id);
       setCompare(false);
       setTool('marquee');
+      setMode('fill');
+      setMargins(emptyMargins);
       setFeather(0);
       setStatus(
         project
@@ -265,7 +347,11 @@ export default function App() {
   const select = (mask: Uint8ClampedArray) => {
     if (doc) {
       changeDocument({ ...doc, selection: mask });
-      setStatus('Selection updated. Use Patch to repair this area.');
+      setStatus(
+        mode === 'repair'
+          ? 'Selection updated. Drag the patch to clean pixels.'
+          : 'Selection updated. Describe the change or choose another editing mode.',
+      );
     }
   };
   const clearSelection = () => {
@@ -325,14 +411,121 @@ export default function App() {
     });
   };
 
+  const generateAi = (settings: AiSettings, resumeId?: string) => {
+    if (!doc || !visible || (settings.operation !== 'expand' && !bounds)) return;
+    void run('AI generation…', async () => {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      let attempt = resumeId ? aiAttempt.current : null;
+      if (!attempt) {
+        const target = settings.operation === 'expand' ? expansion : doc;
+        if (!target || (settings.operation === 'expand' && !hasExpansion))
+          throw new Error('Set valid expansion margins before generating.');
+        const targetBounds = selectionBounds(target.selection, target.width, target.height)!;
+        assertLayerBudget(target, targetBounds.width * targetBounds.height);
+        if (
+          settings.blending === 'poisson' &&
+          targetBounds.width * targetBounds.height > MAX_POISSON_AREA
+        )
+          throw new Error(
+            'This selection is too large for Poisson. Choose None or Feather before generating.',
+          );
+        const prepared = prepareEdit(
+          target,
+          settings.operation === 'expand' ? composite(target) : visible,
+        );
+        const instruction =
+          settings.operation === 'remove'
+            ? `Remove the selected objects and reconstruct the surrounding background naturally. ${settings.prompt}`
+            : settings.operation === 'expand'
+              ? `Extend the scene naturally into the selected empty outer canvas. Preserve the central original image and its scale exactly. ${settings.prompt}`
+              : settings.prompt;
+        attempt = {
+          document: target,
+          prepared,
+          settings,
+          input: {
+            provider: settings.provider,
+            model: settings.model,
+            prompt: instruction,
+            references: settings.references,
+            image: prepared.image,
+            mask: prepared.mask,
+            guide: prepared.guide,
+          },
+          feather,
+        };
+        aiAttempt.current = attempt;
+        setAiJob(null);
+      }
+      if (attempt.document.revision !== doc.revision)
+        throw new Error(
+          'The document changed since this request. Restore that edit state before checking its result.',
+        );
+      const result = await generateImage(
+        attempt.input,
+        controller.signal,
+        (job) => {
+          setAiJob({ ...job, image: undefined });
+          setBusy(`AI · ${job.message}`);
+        },
+        resumeId,
+      );
+      const generated = await loadResult(result, attempt.prepared.region, attempt.document);
+      controller.signal.throwIfAborted();
+      const target = attempt.document;
+      const mask =
+        attempt.settings.blending === 'none'
+          ? target.selection
+          : featherMask(target.selection, target.width, target.height, attempt.feather);
+      const pixels =
+        attempt.settings.blending === 'poisson'
+          ? await blendInWorker(
+              context(composite(target)).getImageData(0, 0, target.width, target.height),
+              mask,
+              0,
+              0,
+              controller.signal,
+              setBusy,
+              generated,
+            )
+          : createPatch(generated, mask, 0, 0);
+      if (!pixels) throw new Error('The selection is empty.');
+      const layer: Layer = {
+        id: crypto.randomUUID(),
+        kind: 'generated',
+        name: `${attempt.settings.operation === 'expand' ? 'Expansion' : attempt.settings.operation === 'remove' ? 'Removal' : 'AI edit'} ${target.layers.filter((item) => item.kind === 'generated').length + 1}`,
+        canvas: pixelsToCanvas(pixels),
+        x: pixels.x,
+        y: pixels.y,
+        visible: true,
+        opacity: 1,
+        generation: {
+          provider: attempt.settings.provider,
+          model: attempt.settings.model,
+          prompt: attempt.settings.prompt,
+          references: attempt.settings.references,
+        },
+      };
+      const preview = composite({ ...target, layers: [...target.layers, layer] }).toDataURL(
+        'image/png',
+      );
+      setAiProposal({ document: target, layer, preview });
+      setStatus('Review the AI edit before accepting it.');
+    });
+  };
+
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if ((event.target as HTMLElement).closest('input, textarea, select, [contenteditable]'))
+      if (
+        event.defaultPrevented ||
+        (event.target as HTMLElement).closest('input, textarea, select, [contenteditable]')
+      )
         return;
       const command = event.ctrlKey || event.metaKey,
         lower = event.key.toLowerCase();
       if (command && ['o', 's', 'z', 'y', 'a', 'd'].includes(lower)) event.preventDefault();
-      if (busy || pendingFile || help) return;
+      if (busy || pendingFile || help || aiProposal) return;
       if (command) {
         if (lower === 'o') pickFile();
         if (lower === 's') event.shiftKey ? exportImage() : save();
@@ -344,7 +537,11 @@ export default function App() {
         return;
       }
       if (doc) {
-        const next = tools.find((entry) => entry.key.toLowerCase() === lower);
+        const family = tools.filter((entry) => entry.key.toLowerCase() === lower);
+        const next =
+          event.shiftKey && family.length > 1
+            ? family[(family.findIndex((entry) => entry.id === tool) + 1) % family.length]
+            : family[0];
         if (next) chooseTool(next.id);
         if (lower === 'escape') {
           setPatchOffset({ x: 0, y: 0 });
@@ -358,7 +555,11 @@ export default function App() {
       }
     };
     const paste = (event: ClipboardEvent) => {
-      if (busy || (event.target as HTMLElement).closest('input, textarea, [contenteditable]'))
+      if (
+        busy ||
+        aiProposal ||
+        (event.target as HTMLElement).closest('input, textarea, [contenteditable]')
+      )
         return;
       const file = Array.from(event.clipboardData?.files || []).find((file) =>
         file.type.startsWith('image/'),
@@ -383,10 +584,11 @@ export default function App() {
   return (
     <div
       className="app"
+      style={{ '--ui-text-scale': textScale } as React.CSSProperties}
       aria-busy={!!busy}
       onDragOver={(event) => {
         event.preventDefault();
-        if (!busy) setDragOver(true);
+        if (!busy && !aiProposal) setDragOver(true);
       }}
       onDragLeave={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOver(false);
@@ -395,7 +597,7 @@ export default function App() {
         event.preventDefault();
         setDragOver(false);
         const file = event.dataTransfer.files[0];
-        if (file && !busy) requestOpen(file);
+        if (file && !busy && !aiProposal) requestOpen(file);
       }}
     >
       <input
@@ -436,6 +638,18 @@ export default function App() {
           {doc && <span className="document-extension">.expand</span>}
         </div>
         <div className="header-actions">
+          <label className="text-size-control">
+            Text{' '}
+            <select
+              aria-label="Interface text size"
+              value={textScale}
+              onChange={(event) => setTextScale(Number(event.target.value))}
+            >
+              <option value={1}>Standard</option>
+              <option value={1.15}>Large</option>
+              <option value={1.3}>Larger</option>
+            </select>
+          </label>
           <IconButton
             label="Undo (Ctrl+Z)"
             onClick={() => setHistory(undo)}
@@ -467,7 +681,21 @@ export default function App() {
           <div className="rail-top">
             <MousePointer2 size={15} />
           </div>
-          {tools.map((entry) => (
+          <ToolGroup
+            label="Marquee tools"
+            options={tools.slice(0, 2)}
+            tool={tool}
+            disabled={!doc || !!busy || mode === 'expand'}
+            onChoose={chooseTool}
+          />
+          <ToolGroup
+            label="Lasso tools"
+            options={tools.slice(2, 5)}
+            tool={tool}
+            disabled={!doc || !!busy || mode === 'expand'}
+            onChoose={chooseTool}
+          />
+          {tools.slice(5).map((entry) => (
             <button
               key={entry.id}
               className={`tool-button ${tool === entry.id ? 'active' : ''}`}
@@ -501,24 +729,33 @@ export default function App() {
         </nav>
 
         <main className="workspace">
+          <div className="mode-bar" role="group" aria-label="Editing mode">
+            {editingModes.map((item) => (
+              <button
+                key={item.id}
+                aria-pressed={mode === item.id}
+                className={mode === item.id ? 'active' : ''}
+                disabled={!!busy || !!aiProposal}
+                onClick={() => chooseMode(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
           <div className="context-bar">
             <div className="context-title">
               <span className="tiny-square" />
-              {tool === 'patch' ? 'LOCAL REPAIR' : tool === 'hand' ? 'NAVIGATION' : 'SELECTION'}
+              {editingModes.find((item) => item.id === mode)!.label}
               <span className="context-divider">/</span>
               <span className="context-tool">
-                {tool === 'patch'
-                  ? 'Patch'
-                  : tool === 'brush'
-                    ? 'Brush'
-                    : tool === 'hand'
-                      ? 'Hand'
-                      : 'Marquee'}
+                {mode === 'expand'
+                  ? 'Adjust canvas bounds'
+                  : tools.find((item) => item.id === tool)?.label}
               </span>
             </div>
             {doc && (
               <div className="context-options">
-                {['marquee', 'brush'].includes(tool) && (
+                {!['hand', 'patch'].includes(tool) && (
                   <div className="segmented" aria-label="Selection operation">
                     {(['replace', 'add', 'subtract'] as const).map((mode, index) => (
                       <button
@@ -579,17 +816,18 @@ export default function App() {
           </div>
 
           <div className="canvas-area">
-            {doc && visible ? (
+            {displayDoc && displayComposite ? (
               <EditorCanvas
                 ref={canvasRef}
-                doc={doc}
-                composite={visible}
+                key={`${doc!.id}-${mode === 'expand' ? 'expand' : 'edit'}`}
+                doc={displayDoc}
+                composite={displayComposite}
                 tool={tool}
                 selectionMode={selectionMode}
                 brushSize={brushSize}
                 showMask={showMask}
                 compare={compare}
-                busy={!!busy}
+                busy={!!busy || !!aiProposal}
                 patchOffset={patchOffset}
                 patchPreview={patchPreview}
                 onSelection={select}
@@ -597,6 +835,7 @@ export default function App() {
                 onZoom={setZoom}
                 onPointer={setPointer}
                 onHint={setStatus}
+                expansion={mode === 'expand' ? { margins, onChange: setMargins } : undefined}
               />
             ) : (
               <div className="empty-workspace">
@@ -677,7 +916,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {doc && bounds && tool !== 'patch' && !compare && (
+            {doc && bounds && tool !== 'patch' && mode !== 'expand' && !compare && (
               <div className="selection-float">
                 <span>
                   <SquareDashed size={14} />
@@ -699,7 +938,7 @@ export default function App() {
                 <span>{busy}</span>
                 {abortRef.current && (
                   <button className="text-button" onClick={() => abortRef.current?.abort()}>
-                    Cancel blending
+                    {busy.startsWith('AI') ? 'Stop local waiting' : 'Cancel blending'}
                   </button>
                 )}
               </div>
@@ -729,113 +968,143 @@ export default function App() {
         </main>
 
         <aside className="inspector" aria-label="Document inspector">
-          <section className="inspector-section properties-section">
-            <div className="section-heading">
-              <span>{tool === 'patch' ? 'Repair settings' : 'Selection'}</span>
-              <SlidersHorizontal size={15} />
-            </div>
-            <p className="section-description">
-              {tool === 'patch'
-                ? 'Borrow clean pixels. Keep every edit reversible.'
-                : 'Good edits start with a little precision.'}
-            </p>
-            <div className="selection-summary">
-              <span className="summary-icon">
-                {tool === 'patch' ? <Scan size={18} /> : <SquareDashed size={18} />}
-              </span>
-              <div>
-                <strong>
-                  {bounds ? `${bounds.width} × ${bounds.height} px` : 'No selection yet'}
-                </strong>
-                <span>{bounds ? 'Selected area' : 'Draw or brush on the canvas'}</span>
-              </div>
-              {bounds && <span className="selection-live" />}
-            </div>
-            <label className="setting-label" htmlFor="feather">
-              Feather inward <span>{feather} px</span>
-            </label>
-            <input
-              id="feather"
-              aria-label="Feather inward"
-              className="range"
-              type="range"
-              min={0}
-              max={32}
-              value={feather}
-              disabled={!doc || !!busy}
-              onChange={(e) => setFeather(Number(e.target.value))}
-            />
-            <div className="range-labels">
-              <span>Precise edge</span>
-              <span>Soft edge</span>
-            </div>
-            {tool === 'patch' ? (
-              <div className="repair-settings">
-                <label className="setting-label" htmlFor="blend-mode">
-                  Seam blending
-                </label>
-                <div className="select-wrap">
-                  <select
-                    id="blend-mode"
-                    aria-label="Seam blending"
-                    value={blendMode}
-                    disabled={!!busy}
-                    onChange={(e) => setBlendMode(e.target.value as 'poisson' | 'feather')}
-                  >
-                    <option value="poisson">Poisson · match the boundary</option>
-                    <option value="feather">Feather · preserve sampled colors</option>
-                  </select>
-                  <ChevronDown size={13} />
-                </div>
-                <p className="setting-help">
-                  {blendMode === 'poisson'
-                    ? 'Blends sampled texture into surrounding tones. The fast preview is blended when you apply.'
-                    : 'Copies the sample with your inward feather setting. Works with transparency.'}
-                </p>
-                <div className="sample-offset">
-                  <span>Sample offset</span>
-                  <code>
-                    {patchOffset.x}, {patchOffset.y} px
-                  </code>
-                </div>
-                <button
-                  className="button primary full"
-                  onClick={applyPatch}
-                  disabled={!patchPreview || !!busy}
-                >
-                  <Check size={15} />
-                  {blendMode === 'poisson' ? 'Blend & apply repair' : 'Apply repair'}
-                </button>
-                <button
-                  className="reset-button"
-                  onClick={() => setPatchOffset({ x: 0, y: 0 })}
-                  disabled={!!busy || (!patchOffset.x && !patchOffset.y)}
-                >
-                  <RotateCcw size={12} />
-                  Reset sample
-                </button>
-              </div>
+          <div className="inspector-controls">
+            {mode === 'expand' && doc ? (
+              <ExpandControls
+                width={doc.width}
+                height={doc.height}
+                margins={margins}
+                onChange={setMargins}
+                disabled={!!busy}
+              />
             ) : (
-              <div className="selection-actions">
-                <button
-                  className="button secondary"
+              <section className="inspector-section properties-section">
+                <div className="section-heading">
+                  <span>{tool === 'patch' ? 'Repair settings' : 'Selection'}</span>
+                  <SlidersHorizontal size={15} />
+                </div>
+                <p className="section-description">
+                  {tool === 'patch'
+                    ? 'Borrow clean pixels. Keep every edit reversible.'
+                    : 'Good edits start with a little precision.'}
+                </p>
+                <div className="selection-summary">
+                  <span className="summary-icon">
+                    {tool === 'patch' ? <Scan size={18} /> : <SquareDashed size={18} />}
+                  </span>
+                  <div>
+                    <strong>
+                      {bounds ? `${bounds.width} × ${bounds.height} px` : 'No selection yet'}
+                    </strong>
+                    <span>{bounds ? 'Selected area' : 'Draw or brush on the canvas'}</span>
+                  </div>
+                  {bounds && <span className="selection-live" />}
+                </div>
+                <label className="setting-label" htmlFor="feather">
+                  Feather inward <span>{feather} px</span>
+                </label>
+                <input
+                  id="feather"
+                  aria-label="Feather inward"
+                  className="range"
+                  type="range"
+                  min={0}
+                  max={32}
+                  value={feather}
                   disabled={!doc || !!busy}
-                  onClick={() =>
-                    doc && select(new Uint8ClampedArray(doc.selection.length).fill(255))
-                  }
-                >
-                  Select all
-                </button>
-                <button
-                  className="button secondary"
-                  disabled={!bounds || !!busy}
-                  onClick={clearSelection}
-                >
-                  Clear
-                </button>
-              </div>
+                  onChange={(e) => setFeather(Number(e.target.value))}
+                />
+                <div className="range-labels">
+                  <span>Precise edge</span>
+                  <span>Soft edge</span>
+                </div>
+                {tool === 'patch' ? (
+                  <div className="repair-settings">
+                    <label className="setting-label" htmlFor="blend-mode">
+                      Seam blending
+                    </label>
+                    <div className="select-wrap">
+                      <select
+                        id="blend-mode"
+                        aria-label="Seam blending"
+                        value={blendMode}
+                        disabled={!!busy}
+                        onChange={(e) => setBlendMode(e.target.value as 'poisson' | 'feather')}
+                      >
+                        <option value="poisson">Poisson · match the boundary</option>
+                        <option value="feather">Feather · preserve sampled colors</option>
+                      </select>
+                      <ChevronDown size={13} />
+                    </div>
+                    <p className="setting-help">
+                      {blendMode === 'poisson'
+                        ? 'Blends sampled texture into surrounding tones. The fast preview is blended when you apply.'
+                        : 'Copies the sample with your inward feather setting. Works with transparency.'}
+                    </p>
+                    <div className="sample-offset">
+                      <span>Sample offset</span>
+                      <code>
+                        {patchOffset.x}, {patchOffset.y} px
+                      </code>
+                    </div>
+                    <button
+                      className="button primary full"
+                      onClick={applyPatch}
+                      disabled={!patchPreview || !!busy}
+                    >
+                      <Check size={15} />
+                      {blendMode === 'poisson' ? 'Blend & apply repair' : 'Apply repair'}
+                    </button>
+                    <button
+                      className="reset-button"
+                      onClick={() => setPatchOffset({ x: 0, y: 0 })}
+                      disabled={!!busy || (!patchOffset.x && !patchOffset.y)}
+                    >
+                      <RotateCcw size={12} />
+                      Reset sample
+                    </button>
+                  </div>
+                ) : (
+                  <div className="selection-actions">
+                    <button
+                      className="button secondary"
+                      disabled={!doc || !!busy}
+                      onClick={() =>
+                        doc && select(new Uint8ClampedArray(doc.selection.length).fill(255))
+                      }
+                    >
+                      Select all
+                    </button>
+                    <button
+                      className="button secondary"
+                      disabled={!bounds || !!busy}
+                      onClick={clearSelection}
+                    >
+                      Clear
+                    </button>
+                    <button
+                      className="button secondary"
+                      disabled={!doc || !!busy}
+                      onClick={() => doc && select(doc.selection.map((value) => 255 - value))}
+                    >
+                      Invert
+                    </button>
+                  </div>
+                )}
+              </section>
             )}
-          </section>
+
+            <AiPanel
+              mode={mode}
+              disabled={!!busy || !!aiProposal}
+              canGenerate={mode === 'expand' ? hasExpansion : !!doc && !!bounds}
+              onGenerate={generateAi}
+              job={aiJob}
+              onResume={() => {
+                if (aiAttempt.current && aiJob) generateAi(aiAttempt.current.settings, aiJob.id);
+              }}
+            />
+          </div>
 
           <section className="layers-section">
             <div className="section-heading layers-heading">
@@ -926,7 +1195,7 @@ export default function App() {
           <div className="inspector-bottom">
             <span className="local-badge">
               <span className="green-dot" />
-              LOCAL EDITING
+              {mode === 'repair' ? 'LOCAL EDITING' : 'AI WORKSPACE'}
             </span>
             <span>Made for a closer look.</span>
           </div>
@@ -989,6 +1258,59 @@ export default function App() {
           </div>
         </div>
       )}
+      {aiProposal && (
+        <div className="modal-backdrop">
+          <div
+            className="modal ai-preview"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ai-review-title"
+          >
+            <h2 id="ai-review-title">Review generated edit</h2>
+            <p>Check alignment, texture, and edges. Only your selected pixels will change.</p>
+            <img src={aiProposal.preview} alt="Preview of the AI edit within your selection" />
+            <div className="modal-actions">
+              <button
+                className="button secondary"
+                autoFocus
+                onClick={() => {
+                  setAiProposal(null);
+                  setStatus('Generated edit discarded. Your document is unchanged.');
+                }}
+              >
+                Discard result
+              </button>
+              <button
+                className="button primary"
+                onClick={() => {
+                  if (doc?.revision !== aiProposal.document.revision) {
+                    setError(
+                      'The document changed. This result cannot be applied to a different edit state.',
+                    );
+                    return;
+                  }
+                  changeDocument({
+                    ...aiProposal.document,
+                    layers: [...aiProposal.document.layers, aiProposal.layer],
+                  });
+                  setSelectedLayer(aiProposal.layer.id);
+                  setAiProposal(null);
+                  if (aiAttempt.current?.settings.operation === 'expand') {
+                    setMode('fill');
+                    setTool('marquee');
+                    setMargins(emptyMargins);
+                  }
+                  setStatus(
+                    'AI edit added as a layer. Pixels outside your selection are preserved.',
+                  );
+                }}
+              >
+                Accept edit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {help && (
         <div className="modal-backdrop" onClick={() => setHelp(false)}>
           <div
@@ -1009,7 +1331,9 @@ export default function App() {
               ['Save project', 'Ctrl S'],
               ['Export PNG', 'Ctrl Shift S'],
               ['Undo / redo', 'Ctrl Z / Ctrl Shift Z'],
-              ['Marquee / brush / patch / hand', 'M / B / P / H'],
+              ['Marquee / lasso / brush / patch / hand', 'M / L / B / P / H'],
+              ['Cycle marquee / lasso group', 'Shift M / Shift L'],
+              ['Finish polygonal lasso', 'Enter / double-click'],
               ['Pan temporarily', 'Space + drag'],
               ['Select all / clear selection', 'Ctrl A / Ctrl D'],
               ['Fit the image', '0'],
@@ -1020,8 +1344,8 @@ export default function App() {
               </div>
             ))}
             <p className="setting-help">
-              This version supports local editing, projects, and Poisson repair. AI generation will
-              be added in the next development stages.
+              AI Fill supports provider settings and references when started with npm run dev.
+              Select an area, enter a prompt, and review the generated edit before accepting it.
             </p>
           </div>
         </div>

@@ -8,16 +8,21 @@ import {
   useState,
 } from 'react';
 import { context, maskToCanvas, type EditorDocument } from '../model/document';
+import type { Margins } from '../model/expand';
 import {
   combineMasks,
   paintMask,
   rectangleMask,
+  ellipseMask,
+  polygonMask,
+  snapToEdge,
   selectionBounds,
   type Point,
   type SelectionMode,
 } from '../model/pixels';
 
-export type Tool = 'marquee' | 'brush' | 'hand' | 'patch';
+export type Tool =
+  'marquee' | 'ellipse' | 'lasso' | 'polygon' | 'magnetic' | 'brush' | 'hand' | 'patch';
 export type CanvasHandle = {
   fit: () => void;
   zoomBy: (factor: number) => void;
@@ -25,7 +30,7 @@ export type CanvasHandle = {
 };
 type View = { x: number; y: number; zoom: number };
 type Drag = {
-  kind: 'pan' | 'marquee' | 'brush' | 'patch';
+  kind: 'pan' | Exclude<Tool, 'hand' | 'polygon'>;
   start: Point;
   last: Point;
   view: View;
@@ -33,6 +38,7 @@ type Drag = {
   stroke: Uint8ClampedArray;
   offset: Point;
   mode: SelectionMode;
+  points: Point[];
 };
 type Props = {
   doc: EditorDocument;
@@ -50,6 +56,7 @@ type Props = {
   onZoom: (zoom: number) => void;
   onPointer: (point: Point | null) => void;
   onHint: (text: string) => void;
+  expansion?: { margins: Margins; onChange: (margins: Margins) => void };
 };
 
 export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanvas(props, ref) {
@@ -61,6 +68,9 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
   const [draft, setDraft] = useState<Uint8ClampedArray | null>(null);
   const [cursor, setCursor] = useState<Point | null>(null);
   const [space, setSpace] = useState(false);
+  const [polygon, setPolygon] = useState<Point[]>([]);
+  const polygonRef = useRef<Point[]>([]);
+  const polygonBase = useRef<{ mask: Uint8ClampedArray; mode: SelectionMode } | null>(null);
   const drag = useRef<Drag | null>(null),
     draftRef = useRef<Uint8ClampedArray | null>(null);
   const fit = () => {
@@ -74,6 +84,39 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
       y: (size.height - doc.height * zoom) / 2,
     });
   };
+  const clearPolygon = () => {
+    polygonRef.current = [];
+    polygonBase.current = null;
+    setPolygon([]);
+  };
+  const finishPolygon = () => {
+    if (polygonRef.current.length >= 3 && polygonBase.current)
+      props.onSelection(
+        combineMasks(
+          polygonBase.current.mask,
+          polygonMask(doc.width, doc.height, polygonRef.current),
+          polygonBase.current.mode,
+        ),
+      );
+    clearPolygon();
+  };
+  useEffect(clearPolygon, [tool, doc.id]);
+  useEffect(() => {
+    const key = (event: KeyboardEvent) => {
+      if (
+        (event.target as HTMLElement).closest('input, textarea, select, [contenteditable]') ||
+        !polygonRef.current.length
+      )
+        return;
+      if (event.key === 'Enter' || event.key === 'Escape') {
+        event.preventDefault();
+        if (event.key === 'Enter') finishPolygon();
+        else clearPolygon();
+      }
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  });
   const zoomTo = (next: number, anchor = { x: size.width / 2, y: size.height / 2 }) =>
     setView((current) => {
       const zoom = Math.max(0.01, Math.min(16, next));
@@ -139,6 +182,13 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
   }, [view, size, busy]);
 
   const activeMask = draft || doc.selection;
+  const magneticPixels = useMemo(
+    () =>
+      tool === 'magnetic'
+        ? context(props.composite).getImageData(0, 0, doc.width, doc.height)
+        : null,
+    [tool, props.composite],
+  );
   const checker = useMemo(() => {
     const tile = document.createElement('canvas');
     tile.width = 24;
@@ -216,6 +266,22 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
         ctx.stroke();
       }
     }
+    if (polygon.length) {
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1.5 / view.zoom;
+      ctx.strokeStyle = '#ffce85';
+      ctx.beginPath();
+      ctx.moveTo(polygon[0].x, polygon[0].y);
+      for (const point of polygon.slice(1)) ctx.lineTo(point.x, point.y);
+      if (cursor) ctx.lineTo((cursor.x - view.x) / view.zoom, (cursor.y - view.y) / view.zoom);
+      ctx.stroke();
+      for (const point of polygon) {
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 3 / view.zoom, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffce85';
+        ctx.fill();
+      }
+    }
     ctx.restore();
     if (tool === 'brush' && cursor && !space && !busy) {
       ctx.beginPath();
@@ -244,6 +310,7 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
     props.brushSize,
     space,
     busy,
+    polygon,
   ]);
 
   const local = (event: React.PointerEvent) => {
@@ -268,6 +335,26 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
       props.onHint('Start dragging inside your selection to choose a sample.');
       return;
     }
+    if (kind === 'polygon') {
+      if (
+        polygonRef.current.length >= 3 &&
+        Math.hypot(image.x - polygonRef.current[0].x, image.y - polygonRef.current[0].y) *
+          view.zoom <
+          8
+      ) {
+        finishPolygon();
+        return;
+      }
+      if (!polygonRef.current.length)
+        polygonBase.current = {
+          mask: doc.selection,
+          mode: event.altKey ? 'subtract' : props.selectionMode,
+        };
+      polygonRef.current = [...polygonRef.current, image];
+      setPolygon(polygonRef.current);
+      props.onHint('Click to add corners. Double-click or press Enter to finish; Escape cancels.');
+      return;
+    }
     event.currentTarget.setPointerCapture(event.pointerId);
     const mode = event.altKey
       ? 'subtract'
@@ -284,6 +371,7 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
       stroke,
       offset: props.patchOffset,
       mode,
+      points: [kind === 'magnetic' && magneticPixels ? snapToEdge(magneticPixels, image) : image],
     };
     if (kind === 'brush') {
       paintMask(stroke, doc.width, doc.height, image, image, props.brushSize / 2);
@@ -328,7 +416,7 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
       });
       return;
     }
-    if (current.kind === 'marquee') {
+    if (current.kind === 'marquee' || current.kind === 'ellipse') {
       let end = image;
       if (event.shiftKey) {
         const side = Math.max(
@@ -340,7 +428,23 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
           y: current.start.y + Math.sign(image.y - current.start.y) * side,
         };
       }
-      current.stroke = rectangleMask(doc.width, doc.height, current.start, end);
+      current.stroke = (current.kind === 'ellipse' ? ellipseMask : rectangleMask)(
+        doc.width,
+        doc.height,
+        current.start,
+        end,
+      );
+    } else if (current.kind === 'lasso' || current.kind === 'magnetic') {
+      const next =
+        current.kind === 'magnetic' && magneticPixels ? snapToEdge(magneticPixels, image) : image;
+      if (
+        Math.hypot(next.x - current.last.x, next.y - current.last.y) > 0.75 &&
+        current.points.length < 4000
+      ) {
+        current.points.push(next);
+        current.last = next;
+      }
+      current.stroke = polygonMask(doc.width, doc.height, current.points);
     } else {
       paintMask(current.stroke, doc.width, doc.height, current.last, image, props.brushSize / 2);
       current.last = image;
@@ -351,7 +455,12 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
   const end = (event: React.PointerEvent<HTMLCanvasElement>, cancelled = false) => {
     const current = drag.current;
     drag.current = null;
-    if (current && !cancelled && draftRef.current && ['brush', 'marquee'].includes(current.kind))
+    if (
+      current &&
+      !cancelled &&
+      draftRef.current &&
+      ['brush', 'marquee', 'ellipse', 'lasso', 'magnetic'].includes(current.kind)
+    )
       props.onSelection(draftRef.current);
     draftRef.current = null;
     setDraft(null);
@@ -386,6 +495,9 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
         onPointerMove={move}
         onPointerUp={(e) => end(e)}
         onPointerCancel={(e) => end(e, true)}
+        onDoubleClick={() => {
+          if (tool === 'polygon' && !busy) finishPolygon();
+        }}
         onPointerLeave={() => {
           setCursor(null);
           props.onPointer(null);
@@ -398,6 +510,81 @@ export const EditorCanvas = forwardRef<CanvasHandle, Props>(function EditorCanva
           {doc.width.toLocaleString()} × {doc.height.toLocaleString()}
         </span>
       </div>
+      {props.expansion &&
+        !props.compare &&
+        (
+          [
+            'top',
+            'right',
+            'bottom',
+            'left',
+            'top-left',
+            'top-right',
+            'bottom-left',
+            'bottom-right',
+          ] as const
+        ).map((edge) => {
+          const left = edge.includes('left')
+            ? view.x
+            : edge.includes('right')
+              ? view.x + doc.width * view.zoom
+              : view.x + (doc.width * view.zoom) / 2;
+          const top = edge.includes('top')
+            ? view.y
+            : edge.includes('bottom')
+              ? view.y + doc.height * view.zoom
+              : view.y + (doc.height * view.zoom) / 2;
+          return (
+            <button
+              key={edge}
+              className="expand-handle"
+              aria-label={`Expand ${edge} handle`}
+              disabled={busy}
+              style={{
+                left,
+                top,
+                cursor: edge.includes('-')
+                  ? edge === 'top-left' || edge === 'bottom-right'
+                    ? 'nwse-resize'
+                    : 'nesw-resize'
+                  : edge === 'top' || edge === 'bottom'
+                    ? 'ns-resize'
+                    : 'ew-resize',
+              }}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.currentTarget.setPointerCapture(event.pointerId);
+                const start = { x: event.clientX, y: event.clientY },
+                  base = props.expansion!.margins;
+                const button = event.currentTarget;
+                const move = (next: PointerEvent) => {
+                  const dx = Math.round((next.clientX - start.x) / view.zoom),
+                    dy = Math.round((next.clientY - start.y) / view.zoom);
+                  const margins = {
+                    left: edge.includes('left') ? Math.max(0, base.left - dx) : base.left,
+                    right: edge.includes('right') ? Math.max(0, base.right + dx) : base.right,
+                    top: edge.includes('top') ? Math.max(0, base.top - dy) : base.top,
+                    bottom: edge.includes('bottom') ? Math.max(0, base.bottom + dy) : base.bottom,
+                  };
+                  props.expansion!.onChange(margins);
+                  setView({
+                    ...view,
+                    x: view.x - (margins.left - base.left) * view.zoom,
+                    y: view.y - (margins.top - base.top) * view.zoom,
+                  });
+                };
+                const end = () => {
+                  button.removeEventListener('pointermove', move);
+                  button.removeEventListener('pointerup', end);
+                  button.removeEventListener('pointercancel', end);
+                };
+                button.addEventListener('pointermove', move);
+                button.addEventListener('pointerup', end);
+                button.addEventListener('pointercancel', end);
+              }}
+            />
+          );
+        })}
     </div>
   );
 });

@@ -42,6 +42,79 @@ export function rectangleMask(
   return mask;
 }
 
+export function ellipseMask(width: number, height: number, a: Point, b: Point): Uint8ClampedArray {
+  const mask = rectangleMask(width, height, a, b);
+  const left = Math.round(Math.min(a.x, b.x)),
+    top = Math.round(Math.min(a.y, b.y));
+  const rx = Math.abs(Math.round(b.x) - Math.round(a.x)) / 2;
+  const ry = Math.abs(Math.round(b.y) - Math.round(a.y)) / 2;
+  if (!rx || !ry) return new Uint8ClampedArray(mask.length);
+  for (let y = Math.max(0, top); y < Math.min(height, top + ry * 2); y++)
+    for (let x = Math.max(0, left); x < Math.min(width, left + rx * 2); x++)
+      if (((x + 0.5 - left - rx) / rx) ** 2 + ((y + 0.5 - top - ry) / ry) ** 2 > 1)
+        mask[y * width + x] = 0;
+  return mask;
+}
+
+/** Scanline rasterization uses pixel centers and the even/odd fill rule. */
+export function polygonMask(width: number, height: number, points: Point[]): Uint8ClampedArray {
+  const mask = new Uint8ClampedArray(width * height);
+  if (points.length < 3) return mask;
+  const top = Math.max(0, Math.floor(Math.min(...points.map((p) => p.y))));
+  const bottom = Math.min(height, Math.ceil(Math.max(...points.map((p) => p.y))));
+  for (let y = top; y < bottom; y++) {
+    const intersections: number[] = [],
+      scan = y + 0.5;
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i],
+        b = points[(i + 1) % points.length];
+      if (a.y > scan !== b.y > scan)
+        intersections.push(a.x + ((scan - a.y) * (b.x - a.x)) / (b.y - a.y));
+    }
+    intersections.sort((a, b) => a - b);
+    for (let i = 0; i + 1 < intersections.length; i += 2) {
+      const left = Math.max(0, Math.ceil(intersections[i] - 0.5));
+      const right = Math.min(width, Math.ceil(intersections[i + 1] - 0.5));
+      if (right > left) mask.fill(255, y * width + left, y * width + right);
+    }
+  }
+  return mask;
+}
+
+/** Snap a magnetic-lasso point to nearby color edges; flat areas keep the pointer location. */
+export function snapToEdge(image: PixelImage, point: Point, radius = 10): Point {
+  let best = point,
+    bestScore = 28;
+  const { width, height, data } = image;
+  for (
+    let y = Math.max(1, Math.round(point.y) - radius);
+    y <= Math.min(height - 2, Math.round(point.y) + radius);
+    y++
+  )
+    for (
+      let x = Math.max(1, Math.round(point.x) - radius);
+      x <= Math.min(width - 2, Math.round(point.x) + radius);
+      x++
+    ) {
+      const distance = Math.hypot(x + 0.5 - point.x, y + 0.5 - point.y);
+      if (distance > radius) continue;
+      let gradient = 0;
+      for (let channel = 0; channel < 3; channel++) {
+        const i = (y * width + x) * 4 + channel;
+        gradient += Math.hypot(
+          data[i + 4] - data[i - 4],
+          data[i + width * 4] - data[i - width * 4],
+        );
+      }
+      const score = gradient / 3 - distance * 12;
+      if (score > bestScore) {
+        bestScore = score;
+        best = { x: x + 0.5, y: y + 0.5 };
+      }
+    }
+  return best;
+}
+
 export function combineMasks(
   base: Uint8ClampedArray,
   stroke: Uint8ClampedArray,

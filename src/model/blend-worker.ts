@@ -8,6 +8,7 @@ export function blendInWorker(
   dy: number,
   signal: AbortSignal,
   progress: (text: string) => void,
+  source?: PixelImage,
 ): Promise<PoissonResult> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('../workers/poisson.worker.ts', import.meta.url), {
@@ -39,6 +40,6 @@ export function blendInWorker(
       finish();
       reject(new Error('The blending worker could not run. Try again or use Feather.'));
     };
-    worker.postMessage({ image, mask, dx, dy });
+    worker.postMessage({ image, mask, dx, dy, source });
   });
 }

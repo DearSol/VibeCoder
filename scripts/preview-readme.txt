@@ -24,7 +24,12 @@ bounds no larger than 262,144 pixels (for example, 512 by 512).
 Save projects before closing. There is no automatic recovery yet.
 Browser saves go to your Downloads folder unless the browser asks for a location.
 
-This is a browser preview, not a native Windows installer. Local editing,
-Poisson repairs, projects, and PNG export are implemented. AI generation,
-reference-guided inpainting, generative expansion, and API-key settings are
-not connected yet. Current editing runs locally on your PC.
+This is a static browser preview, not a native Windows installer. Local editing,
+grouped selection tools, Poisson repairs, projects, and PNG export work here.
+AI controls require the local service supplied by the source checkout:
+git clone --branch codex/expand-studio-preview https://github.com/DearSol/VibeCoder.git
+cd VibeCoder
+npm ci
+npm run dev
+Then open the address printed by Vite. See the repository README for provider
+keys, model compatibility, charges, and the experimental Kie limitation.

@@ -6,6 +6,9 @@ test-results/
 playwright-report/
 .vite/
 *.local
+.env
+.env.*
+!.env.example
 .DS_Store
 *.tsbuildinfo
 src-tauri/gen/

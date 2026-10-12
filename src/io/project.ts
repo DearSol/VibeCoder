@@ -31,6 +31,12 @@ type Manifest = {
     y: number;
     visible: boolean;
     opacity: number;
+    generation?: {
+      provider: string;
+      model: string;
+      prompt: string;
+      references: { name: string; asset: string }[];
+    };
   }[];
 };
 
@@ -51,6 +57,24 @@ export async function saveProject(doc: EditorDocument): Promise<Uint8Array> {
   for (const [index, layer] of doc.layers.entries()) {
     const asset = `assets/layer-${index}.png`;
     files[asset] = [new Uint8Array(await (await toPng(layer.canvas)).arrayBuffer()), { level: 0 }];
+    const generation = layer.generation
+      ? {
+          provider: layer.generation.provider,
+          model: layer.generation.model,
+          prompt: layer.generation.prompt,
+          references: [] as { name: string; asset: string }[],
+        }
+      : undefined;
+    if (generation && layer.generation) {
+      for (const [referenceIndex, reference] of layer.generation.references.entries()) {
+        const asset = `assets/reference-${index}-${referenceIndex}.png`;
+        files[asset] = [
+          new Uint8Array(await (await fetch(reference.image)).arrayBuffer()),
+          { level: 0 },
+        ];
+        generation.references.push({ name: reference.name, asset });
+      }
+    }
     manifest.layers.push({
       id: layer.id,
       name: layer.name,
@@ -60,6 +84,7 @@ export async function saveProject(doc: EditorDocument): Promise<Uint8Array> {
       y: layer.y,
       visible: layer.visible,
       opacity: layer.opacity,
+      generation,
     });
   }
   files[manifest.selection] = [
@@ -105,7 +130,7 @@ function validateManifest(value: unknown): Manifest {
       ids.has(layer.id) ||
       typeof layer.name !== 'string' ||
       layer.asset !== `assets/layer-${index}.png` ||
-      !['original', 'patch'].includes(layer.kind) ||
+      !['original', 'patch', 'generated'].includes(layer.kind) ||
       typeof layer.visible !== 'boolean' ||
       !Number.isFinite(layer.opacity) ||
       layer.opacity < 0 ||
@@ -123,6 +148,27 @@ function validateManifest(value: unknown): Manifest {
         'The project must contain one original image at the bottom of the layer stack.',
       );
     ids.add(layer.id);
+    if (layer.generation) {
+      const g = layer.generation;
+      if (
+        layer.kind !== 'generated' ||
+        !['openai', 'google', 'openrouter', 'kie'].includes(g.provider) ||
+        typeof g.model !== 'string' ||
+        g.model.length > 150 ||
+        typeof g.prompt !== 'string' ||
+        g.prompt.length > 8000 ||
+        !Array.isArray(g.references) ||
+        g.references.length > 4 ||
+        g.references.some(
+          (ref, r) =>
+            !ref ||
+            typeof ref.name !== 'string' ||
+            ref.name.length > 200 ||
+            ref.asset !== `assets/reference-${index}-${r}.png`,
+        )
+      )
+        throw new Error('The project contains invalid generation metadata.');
+    }
   }
   return m;
 }
@@ -140,7 +186,7 @@ export async function loadProject(file: File): Promise<EditorDocument> {
         filter: (entry) => {
           total += entry.originalSize;
           entries++;
-          if (total > MAX_ARCHIVE_BYTES || entry.originalSize > 70_000_000 || entries > 40)
+          if (total > MAX_ARCHIVE_BYTES || entry.originalSize > 70_000_000 || entries > 200)
             throw new Error('This project exceeds the supported archive limits.');
           return true;
         },
@@ -182,7 +228,24 @@ export async function loadProject(file: File): Promise<EditorDocument> {
         surface.height !== manifest.height)
     )
       throw new Error('The original image does not match the document dimensions.');
-    layers.push({ ...entry, canvas: surface });
+    let generation: Layer['generation'];
+    if (entry.generation) {
+      generation = {
+        provider: entry.generation.provider,
+        model: entry.generation.model,
+        prompt: entry.generation.prompt,
+        references: [],
+      };
+      for (const ref of entry.generation.references) {
+        const image = await decodeImage(
+          new Blob([new Uint8Array(read(ref.asset))], { type: 'image/png' }),
+        );
+        if (image.width > 1024 || image.height > 1024)
+          throw new Error('A project reference exceeds the supported size.');
+        generation.references.push({ name: ref.name, image: image.toDataURL('image/png') });
+      }
+    }
+    layers.push({ ...entry, generation, canvas: surface });
   }
   const selectionImage = await decodeImage(
     new Blob([new Uint8Array(read(manifest.selection))], { type: 'image/png' }),
